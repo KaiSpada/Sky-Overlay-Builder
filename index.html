@@ -149,7 +149,49 @@
   button.act.line:hover:not(:disabled){border-color:#d5d1c9}
   button.act:disabled{opacity:.42;cursor:not-allowed}
   .paths{font-family:var(--mono);font-size:11px;color:var(--dim);line-height:1.9;margin:14px 0 0;white-space:pre-wrap}
-  @media(prefers-reduced-motion:reduce){*{transition:none!important}}
+  /* ---- motion ---- */
+  @keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+  @keyframes pop{0%{transform:scale(1)}40%{transform:scale(1.015)}100%{transform:scale(1)}}
+  @keyframes sheen{from{opacity:0}to{opacity:1}}
+  .panel{animation:rise .5s cubic-bezier(.22,.8,.3,1) both}
+  .stack .panel:nth-child(2){animation-delay:.06s}
+  .stack .panel:nth-child(3){animation-delay:.12s}
+  .duo .panel:nth-child(2){animation-delay:.06s}
+
+  /* springy toggle */
+  .switch .track::after{transition:transform .34s cubic-bezier(.34,1.56,.64,1),background .2s}
+  .switch .track{transition:background .22s ease}
+  .switch:active .track::after{width:21px}
+
+  /* buttons lift and press */
+  button.act{transition:transform .14s cubic-bezier(.22,.8,.3,1),box-shadow .18s,border-color .18s,opacity .15s,background-position .2s}
+  button.act:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 4px 12px rgba(51,51,58,.1)}
+  button.act:active:not(:disabled){transform:translateY(0) scale(.985);box-shadow:none;transition-duration:.06s}
+  button.act.working{background-image:linear-gradient(to right,var(--accent-soft) var(--p,0%),transparent var(--p,0%));
+    background-repeat:no-repeat;border-color:var(--accent)}
+
+  /* intake */
+  #drop{transition:border-color .2s,background .2s,transform .2s cubic-bezier(.22,.8,.3,1)}
+  #drop.hot{transform:scale(1.015)}
+  #drop.loaded{animation:pop .5s cubic-bezier(.22,.8,.3,1)}
+
+  /* sliders */
+  input[type=range]::-webkit-slider-thumb{transition:transform .14s cubic-bezier(.34,1.56,.64,1),box-shadow .16s}
+  input[type=range]:hover::-webkit-slider-thumb{transform:scale(1.12)}
+  input[type=range]:active::-webkit-slider-thumb{transform:scale(1.25);box-shadow:0 0 0 6px rgba(90,168,60,.16)}
+  input[type=range]::-moz-range-thumb{transition:transform .14s cubic-bezier(.34,1.56,.64,1)}
+  input[type=range]:active::-moz-range-thumb{transform:scale(1.2)}
+
+  /* tooltips drift up as they fade in */
+  [data-tip]::after{transform:translateY(5px);transition:opacity .16s ease,transform .22s cubic-bezier(.22,.8,.3,1),visibility .16s}
+  [data-tip]:hover::after,[data-tip]:focus-visible::after{transform:translateY(0)}
+
+  /* first render of a new photo fades up */
+  #sheetWrap.fresh canvas,.porthole.fresh canvas{animation:sheen .45s ease both}
+  .porthole canvas{transition:box-shadow .25s}
+  .porthole canvas:hover{box-shadow:0 2px 6px rgba(51,51,58,.12),0 12px 32px rgba(51,51,58,.1)}
+
+  @media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
 </head>
 <body>
@@ -337,6 +379,21 @@ var tmp = document.createElement("canvas"), tctx = tmp.getContext("2d");
 var srcData = null;
 var PREVIEW_TILE = 256, curT = PREVIEW_TILE, sheetData = null;
 var $ = function(id){ return document.getElementById(id); };
+function flash(el,cls,ms){
+  if(!el) return;
+  el.classList.remove(cls);
+  void el.offsetWidth;                                 // restart the animation
+  el.classList.add(cls);
+  setTimeout(function(){ el.classList.remove(cls); }, ms);
+}
+function progress(btn,pct){
+  btn.classList.add("working");
+  btn.style.setProperty("--p", pct+"%");
+}
+function progressDone(btn){
+  btn.classList.remove("working");
+  btn.style.removeProperty("--p");
+}
 
 /* ---------- crop any photo to a 2:1 equirectangular frame ---------- */
 function buildSource(){
@@ -428,6 +485,9 @@ function loadFile(f){
     if(!state.imgW || !state.imgH) throw new Error("empty");
     $("dropTitle").textContent = f.name;
     $("dropSub").textContent = state.imgW+" × "+state.imgH+" — choose another to replace";
+    flash(drop,"loaded",600);
+    flash($("sheetWrap"),"fresh",500);
+    flash(stage,"fresh",500);
     if(!$("packfile").dataset.touched) $("packfile").value = prettyName(f.name);
     $("dlZip").disabled = false; $("dlPng").disabled = false; $("vidBtn").disabled = false;
     buildSource(); render();
@@ -618,12 +678,14 @@ function exportVideo(){
     wx.putImageData(buf, 0, 0);
     work.toBlob(function(b){
       if(!b){                                          // canvas refused to encode
-        btn.disabled = false; btn.textContent = "Frame capture failed";
+        progressDone(btn); btn.disabled = false; btn.textContent = "Frame capture failed";
         frames.length = 0; lastFrames = null; render();
         return;
       }
       frames.push(b); i++;
-      btn.textContent = "Rendering " + Math.round(i/N*100) + "%";
+      var pct = Math.round(i/N*100);
+      btn.textContent = "Rendering " + pct + "%";
+      progress(btn, pct);
       if(i < N) setTimeout(step, 0); else record();
     }, "image/jpeg", 0.95);
   }
@@ -659,12 +721,12 @@ function exportVideo(){
       document.removeEventListener("visibilitychange", onVis);
       if(c.parentNode) c.parentNode.removeChild(c);
       if(!aborted && drawn < 2){
-        btn.disabled = false; btn.textContent = "Capture stalled — try again";
+        progressDone(btn); btn.disabled = false; btn.textContent = "Capture stalled — try again";
         return;
       }
       if(aborted){                                     // tab was hidden mid-clip
         for(var k1 in ready){ if(ready[k1] && ready[k1].close) ready[k1].close(); }
-        btn.disabled = false;
+        progressDone(btn); btn.disabled = false;
         btn.textContent = "Interrupted — click to retry";
         return;                                        // frames kept, retry is instant
       }
@@ -673,7 +735,7 @@ function exportVideo(){
       save(new Blob(chunks, {type:mime}), name + " preview." + ext);
       for(var k2 in ready){ if(ready[k2] && ready[k2].close) ready[k2].close(); }
       frames.length = 0; lastFrames = null;
-      btn.disabled = false; btn.textContent = "Export spin video";
+      progressDone(btn); btn.disabled = false; btn.textContent = "Export spin video";
     };
 
     /* paced by the clock, not by tick count: if a decode or the encoder falls
@@ -711,7 +773,9 @@ function exportVideo(){
         if(lastBm){ cx.drawImage(lastBm, 0, 0); drawn++; }   // redraw keeps frames flowing
         window_(k);
         lastK = k;
-        btn.textContent = "Recording " + Math.round(elapsed/(VID.sec*10)) + "%";
+        var pct = Math.round(elapsed/(VID.sec*10));
+        btn.textContent = "Recording " + pct + "%";
+        progress(btn, pct);
       }
       requestAnimationFrame(tick);
     }
