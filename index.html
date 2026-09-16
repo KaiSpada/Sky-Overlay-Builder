@@ -589,6 +589,7 @@ function pickMime(){
   }
   return null;
 }
+var lastFrames = null;
 function exportVideo(){
   var btn = $("vidBtn");
   if(!state.img || !sheetData) return;
@@ -596,9 +597,14 @@ function exportVideo(){
   if(!mime){ btn.disabled = true; btn.textContent = "Video not supported here"; return; }
 
   btn.disabled = true;
+  if(lastFrames && lastFrames.length === VID.fps*VID.sec){   // interrupted run, frames still good
+    var frames = lastFrames;
+    record();
+    return;
+  }
   render(state.tile);                                 // full sheet resolution for the clip
   var sd = sheetData.data, T = curT;
-  var N = VID.fps*VID.sec, frames = [], i = 0;
+  var N = VID.fps*VID.sec, frames = lastFrames = [], i = 0;
 
   var work = document.createElement("canvas");
   work.width = VID.w; work.height = VID.h;
@@ -611,6 +617,11 @@ function exportVideo(){
     castInto(buf.data, VID.w, VID.h, t*TAU, pitch, VID.fov, sd, T);
     wx.putImageData(buf, 0, 0);
     work.toBlob(function(b){
+      if(!b){                                          // canvas refused to encode
+        btn.disabled = false; btn.textContent = "Frame capture failed";
+        frames.length = 0; lastFrames = null; render();
+        return;
+      }
       frames.push(b); i++;
       btn.textContent = "Rendering " + Math.round(i/N*100) + "%";
       if(i < N) setTimeout(step, 0); else record();
@@ -621,48 +632,96 @@ function exportVideo(){
     render();                                          // restore the live preview
     var c = document.createElement("canvas");
     c.width = VID.w; c.height = VID.h;
+    c.style.cssText = "position:fixed;left:-99999px;top:0;width:320px;height:180px";
+    document.body.appendChild(c);                      // detached canvases can stop streaming
     var cx = c.getContext("2d");
 
-    var ready = new Array(frames.length);
+    var ready = {}, lastBm = null, drawn = 0;
     function decode(k){
-      if(k >= frames.length || ready[k]) return;
-      createImageBitmap(frames[k]).then(function(bm){ ready[k] = bm; });
+      if(k < 0 || k >= frames.length || ready[k]) return;
+      ready[k] = "pending";
+      createImageBitmap(frames[k]).then(function(bm){ ready[k] = bm; },
+                                        function(){ ready[k] = "failed"; });
     }
-    for(var d=0; d<VID.lookahead; d++) decode(d);
+    function window_(k){
+      for(var d=0; d<VID.lookahead; d++) decode(k+d);
+      for(var old in ready){                           // release what has gone by
+        var bm = ready[old];
+        if(+old < k-1 && bm && bm !== lastBm && bm.close){ bm.close(); delete ready[old]; }
+      }
+    }
+    window_(0);
 
-    var rec = new MediaRecorder(c.captureStream(VID.fps), {mimeType:mime, videoBitsPerSecond:20000000});
+    var rec = new MediaRecorder(c.captureStream(VID.fps), {mimeType:mime, videoBitsPerSecond:12000000});
     var chunks = [];
     rec.ondataavailable = function(e){ if(e.data && e.data.size) chunks.push(e.data); };
     rec.onstop = function(){
+      document.removeEventListener("visibilitychange", onVis);
+      if(c.parentNode) c.parentNode.removeChild(c);
+      if(!aborted && drawn < 2){
+        btn.disabled = false; btn.textContent = "Capture stalled — try again";
+        return;
+      }
+      if(aborted){                                     // tab was hidden mid-clip
+        for(var k1 in ready){ if(ready[k1] && ready[k1].close) ready[k1].close(); }
+        btn.disabled = false;
+        btn.textContent = "Interrupted — click to retry";
+        return;                                        // frames kept, retry is instant
+      }
       var ext = mime.indexOf("mp4") >= 0 ? "mp4" : "webm";
       var name = ($("packfile").value || "sky").replace(/[\/\\:*?"<>|]/g,"").trim() || "sky";
       save(new Blob(chunks, {type:mime}), name + " preview." + ext);
-      ready.forEach(function(bm){ if(bm && bm.close) bm.close(); });
-      frames.length = 0;
+      for(var k2 in ready){ if(ready[k2] && ready[k2].close) ready[k2].close(); }
+      frames.length = 0; lastFrames = null;
       btn.disabled = false; btn.textContent = "Export spin video";
     };
 
-    var k = 0;
-    function begin(){
-      if(!ready[0]){ setTimeout(begin, 30); return; }   // wait for the first frame
-      cx.drawImage(ready[0], 0, 0);
-      rec.start();
-      var iv = setInterval(function(){
-        if(k >= frames.length){
-          clearInterval(iv);
-          setTimeout(function(){ rec.stop(); }, 250);
-          return;
-        }
+    /* paced by the clock, not by tick count: if a decode or the encoder falls
+       behind, a frame is skipped rather than the whole clip running long */
+    /* a hidden tab suspends requestAnimationFrame, so the clip would otherwise
+       record a frozen frame for as long as you were away. pausing the recorder
+       freezes its timeline too, and resuming stitches the halves together with
+       no gap. browsers without pause support fall back to abort-and-retry. */
+    var t0, lastK = -1, aborted = false, pausedAt = 0;
+    var canPause = typeof MediaRecorder.prototype.pause === "function";
+    function onVis(){
+      if(document.hidden){
+        if(rec.state !== "recording") return;
+        if(canPause){ pausedAt = performance.now(); rec.pause(); btn.textContent = "Paused"; }
+        else { aborted = true; rec.stop(); }
+      } else if(rec.state === "paused"){
+        t0 += performance.now() - pausedAt;             // do not count time away
+        rec.resume();
+        requestAnimationFrame(tick);
+      }
+    }
+    document.addEventListener("visibilitychange", onVis);
+
+    function tick(){
+      if(aborted || rec.state === "paused") return;
+      var elapsed = performance.now() - t0;
+      if(elapsed >= VID.sec*1000){
+        setTimeout(function(){ rec.stop(); }, 200);
+        return;
+      }
+      var k = Math.min(frames.length-1, Math.floor(elapsed/1000*VID.fps));
+      if(k !== lastK){
         var bm = ready[k];
-        if(bm){                                        // if a decode is late, the
-          cx.drawImage(bm, 0, 0);                      // previous frame stays up
-          if(bm.close) bm.close();
-          ready[k] = null;
-        }
-        decode(k + VID.lookahead);
-        k++;
-        btn.textContent = "Recording " + Math.round(k/frames.length*100) + "%";
-      }, 1000/VID.fps);
+        if(bm && bm !== "pending" && bm !== "failed"){ lastBm = bm; }
+        if(lastBm){ cx.drawImage(lastBm, 0, 0); drawn++; }   // redraw keeps frames flowing
+        window_(k);
+        lastK = k;
+        btn.textContent = "Recording " + Math.round(elapsed/(VID.sec*10)) + "%";
+      }
+      requestAnimationFrame(tick);
+    }
+    function begin(){
+      if(!ready[0] || ready[0] === "pending"){ setTimeout(begin, 30); return; }
+      lastBm = ready[0];
+      cx.drawImage(lastBm, 0, 0);
+      rec.start();
+      t0 = performance.now();
+      requestAnimationFrame(tick);
     }
     begin();
   }
