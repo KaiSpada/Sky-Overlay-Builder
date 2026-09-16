@@ -591,43 +591,54 @@ document.addEventListener("keydown", function(e){ if(e.key === "Escape" && stage
 
 var camYaw = 0, camPitch = 0.12, camFov = 70, zoomT = null;
 var CARD = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
-/* one perspective frame of the cubemap, written straight into an ImageData buffer */
-function castInto(od, W, H, yaw, pitch, fovDeg, sd, T){
+/* One perspective frame, sampled straight from the cropped panorama rather than
+   from the preview sheet — so what you see carries the photo's own detail
+   instead of the 256px faces the sheet is drawn at. Bilinear, to match drawPano. */
+function castInto(od, W, H, yaw, pitch, fovDeg){
+  var sd = srcData ? srcData.data : null;
+  var sw = srcData ? srcData.width : 0, sh = srcData ? srcData.height : 0;
   var fov = fovDeg*Math.PI/180, tanY = Math.tan(fov/2), tanX = tanY*(W/H);
   var cy = Math.cos(yaw), sy = Math.sin(yaw);
   var cp = Math.cos(pitch), sp = Math.sin(pitch);
   var fwd = [sy*cp, sp, -cy*cp], right = [cy, 0, sy];
   var up = [ right[1]*fwd[2]-right[2]*fwd[1], right[2]*fwd[0]-right[0]*fwd[2], right[0]*fwd[1]-right[1]*fwd[0] ];
+  var yawOff = state.yaw*Math.PI/180, TAU = Math.PI*2;
   for(var py=0;py<H;py++){
     var ndcY = (1 - 2*(py+0.5)/H)*tanY;
     for(var px=0;px<W;px++){
+      var oi = (py*W+px)*4;
+      if(!sd){ od[oi]=6; od[oi+1]=18; od[oi+2]=32; od[oi+3]=255; continue; }
       var ndcX = (2*(px+0.5)/W - 1)*tanX;
       var dx = fwd[0]+right[0]*ndcX+up[0]*ndcY;
       var dy = fwd[1]+right[1]*ndcX+up[1]*ndcY;
       var dz = fwd[2]+right[2]*ndcX+up[2]*ndcY;
-      var ax=Math.abs(dx), ay=Math.abs(dy), az=Math.abs(dz), face,u,v;
-      if(ay>=ax && ay>=az){
-        if(dy>0){ face="top"; u=dx/dy; v=-dz/dy; } else { face="bottom"; u=dx/-dy; v=dz/-dy; }
-      } else if(ax>=az){
-        if(dx>0){ face="east"; u=dz/dx; v=-dy/dx; } else { face="west"; u=-dz/-dx; v=-dy/-dx; }
-      } else {
-        if(dz<0){ face="north"; u=dx/-dz; v=-dy/-dz; } else { face="south"; u=-dx/dz; v=-dy/dz; }
+      var len = Math.sqrt(dx*dx+dy*dy+dz*dz);
+      var lon = Math.atan2(dx, -dz) + yawOff;
+      var lat = Math.asin(dy/len);
+      var fx = ((lon/TAU+0.5)%1+1)%1 * sw - 0.5;
+      var fy = (0.5 - lat/Math.PI) * sh - 0.5;
+      var x0 = Math.floor(fx), y0 = Math.floor(fy);
+      var ax = fx-x0, ay = fy-y0;
+      var x1 = (x0+1)%sw, y1 = Math.min(y0+1, sh-1);
+      if(x0<0) x0 = sw-1;
+      if(y0<0) y0 = 0;
+      if(y0>sh-1) y0 = sh-1;
+      var i00=(y0*sw+x0)*4, i10=(y0*sw+x1)*4, i01=(y1*sw+x0)*4, i11=(y1*sw+x1)*4;
+      for(var c=0;c<3;c++){
+        var a = sd[i00+c]+(sd[i10+c]-sd[i00+c])*ax;
+        var b = sd[i01+c]+(sd[i11+c]-sd[i01+c])*ax;
+        od[oi+c] = a+(b-a)*ay;
       }
-      var f = FACES[face];
-      var tx = Math.min(T-1, Math.max(0, ((u+1)/2*T)|0));
-      var ty = Math.min(T-1, Math.max(0, ((v+1)/2*T)|0));
-      var si = ((f.row*T+ty)*T*3 + (f.col*T+tx))*4;
-      var oi = (py*W+px)*4, a = sd[si+3]/255;
-      od[oi]   = sd[si]*a   + 6*(1-a);
-      od[oi+1] = sd[si+1]*a + 18*(1-a);
-      od[oi+2] = sd[si+2]*a + 32*(1-a);
+      var al = (sd[i00+3]+(sd[i10+3]-sd[i00+3])*ax)/255;
+      od[oi]   = od[oi]*al   + 6*(1-al);
+      od[oi+1] = od[oi+1]*al + 18*(1-al);
+      od[oi+2] = od[oi+2]*al + 32*(1-al);
       od[oi+3] = 255;
     }
   }
 }
 
 function drawLook(hi){
-  if(!sheetData) return;
   var fs = isFS(), W, H;
   if(fs){
     var cap = hi ? 1100 : 620;
@@ -637,7 +648,7 @@ function drawLook(hi){
   } else { W = H = 300; }
   look.width = W; look.height = H;
   var out = lctx.createImageData(W,H);
-  castInto(out.data, W, H, camYaw, camPitch, camFov, sheetData.data, curT);
+  castInto(out.data, W, H, camYaw, camPitch, camFov);
   lctx.putImageData(out,0,0);
   var deg = ((camYaw*180/Math.PI)%360+360)%360;
   var degTxt = ("00"+Math.round(deg)).slice(-3)+"°", cardTxt = CARD[Math.round(deg/22.5)%16];
@@ -677,8 +688,6 @@ function exportVideo(){
     record();
     return;
   }
-  render(state.tile);                                 // full sheet resolution for the clip
-  var sd = sheetData.data, T = curT;
   var N = VID.fps*VID.sec, frames = lastFrames = [], i = 0;
 
   var work = document.createElement("canvas");
@@ -689,7 +698,7 @@ function exportVideo(){
   function step(){
     var t = i/N, TAU = Math.PI*2;
     var pitch = (VID.pitch + VID.sway*Math.sin(t*TAU*VID.sways))*Math.PI/180;
-    castInto(buf.data, VID.w, VID.h, t*TAU, pitch, VID.fov, sd, T);
+    castInto(buf.data, VID.w, VID.h, t*TAU, pitch, VID.fov);
     wx.putImageData(buf, 0, 0);
     work.toBlob(function(b){
       if(!b){                                          // canvas refused to encode
@@ -706,7 +715,6 @@ function exportVideo(){
   }
 
   function record(){
-    render();                                          // restore the live preview
     var c = document.createElement("canvas");
     c.width = VID.w; c.height = VID.h;
     c.style.cssText = "position:fixed;left:-99999px;top:0;width:320px;height:180px";
