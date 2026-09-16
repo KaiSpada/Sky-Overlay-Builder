@@ -233,7 +233,7 @@
           <div class="bearing"><span class="deg" id="degOut">000°</span><span class="card" id="cardOut">N</span></div>
           <button type="button" class="act line mini" id="fsBtn">Fullscreen</button>
           <button type="button" class="act line mini" id="vidBtn" disabled>Export spin video</button>
-          <p class="note">Drag to look around, scroll to zoom</p>
+          <p class="note">Drag to look around, scroll to zoom. F for fullscreen, R to spin</p>
         </div>
 
         <div class="panel">
@@ -422,16 +422,21 @@ function buildSource(){
   $("cropState").textContent = trimmed ? "" : "Already 2:1 — nothing is trimmed.";
 }
 
-/* fold the right edge onto the left so the wrap has no hard seam */
+/* Fold the right edge onto the left so the wrap has no hard seam.
+   The fold is written rolled by half the discarded width, which both re-centres
+   the photo and puts the blend band astride the wrap point — so the result needs
+   exactly one resample, with no internal join to crease. */
 function blendSeam(ow,oh){
   var w = Math.max(2, Math.round(ow*state.seamAmt/100)), keep = ow - w;
   var img = srcCtx.getImageData(0,0,ow,oh), d = img.data;
   var out = tctx.createImageData(keep,oh), o = out.data;
+  var roll = Math.round(w/2);
   for(var y=0;y<oh;y++){
-    for(var x=0;x<keep;x++){
-      var si = (y*ow+x)*4, oi = (y*keep+x)*4;
+    for(var xo=0;xo<keep;xo++){
+      var x = (xo + roll) % keep;
+      var si = (y*ow+x)*4, oi = (y*keep+xo)*4;
       if(x < w){
-        var t = x/w, ti = (y*ow + keep + x)*4;
+        var u = x/w, t = u*u*(3-2*u), ti = (y*ow + keep + x)*4;
         for(var c=0;c<4;c++) o[oi+c] = d[si+c]*t + d[ti+c]*(1-t);
       } else {
         for(var c2=0;c2<4;c2++) o[oi+c2] = d[si+c2];
@@ -440,12 +445,8 @@ function blendSeam(ow,oh){
   }
   tmp.width = keep; tmp.height = oh;
   tctx.putImageData(out,0,0);
-  /* stretching keep back up to ow is anchored at x=0, which slides every feature
-     right; roll it back by half the discarded width so the photo stays centred */
-  var shift = ow*w/(2*keep);
   srcCtx.clearRect(0,0,ow,oh);
-  srcCtx.drawImage(tmp,0,0,keep,oh, -shift,0,ow,oh);
-  srcCtx.drawImage(tmp,0,0,keep,oh, ow-shift,0,ow,oh);
+  srcCtx.drawImage(tmp,0,0,keep,oh, 0,0,ow,oh);
 }
 
 /* ---------------- intake ---------------- */
@@ -587,7 +588,30 @@ function exitFS(){
 }
 document.addEventListener("fullscreenchange", function(){ setTimeout(function(){ drawLook(true); }, 60); });
 window.addEventListener("resize", function(){ if(isFS()) drawLook(true); });
-document.addEventListener("keydown", function(e){ if(e.key === "Escape" && stage.classList.contains("faux")) exitFS(); });
+document.addEventListener("keydown", function(e){
+  if(e.key === "Escape" && stage.classList.contains("faux")){ exitFS(); return; }
+  var el = document.activeElement, tag = el ? el.tagName : "";
+  if(tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+  if(e.metaKey || e.ctrlKey || e.altKey) return;
+  var k = e.key.toLowerCase();
+  if(k === "f"){ e.preventDefault(); isFS() ? exitFS() : enterFS(); }
+  else if(k === "r"){ e.preventDefault(); toggleSpin(); }
+});
+
+var SPIN_RATE = Math.PI*2/20;                          // one turn every 20 seconds
+var spinOn = false, spinLast = 0;
+function spinStep(ts){
+  if(!spinOn) return;
+  if(spinLast) camYaw += (ts-spinLast)/1000*SPIN_RATE;
+  spinLast = ts;
+  drawLook();
+  requestAnimationFrame(spinStep);
+}
+function toggleSpin(){
+  spinOn = !spinOn;
+  spinLast = 0;
+  if(spinOn) requestAnimationFrame(spinStep);
+}
 
 var camYaw = 0, camPitch = 0.12, camFov = 70, zoomT = null;
 var CARD = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
@@ -818,7 +842,10 @@ function exportVideo(){
 
 (function dragLook(){
   var down=false, lx=0, ly=0;
-  look.addEventListener("pointerdown",function(e){ down=true; lx=e.clientX; ly=e.clientY; look.setPointerCapture(e.pointerId); });
+  look.addEventListener("pointerdown",function(e){
+    down=true; spinOn=false;                           // taking the wheel stops the spin
+    lx=e.clientX; ly=e.clientY; look.setPointerCapture(e.pointerId);
+  });
   look.addEventListener("pointermove",function(e){
     if(!down) return;
     camYaw -= (e.clientX-lx)*0.006;   // drag right, sky moves right, view turns left
