@@ -383,8 +383,12 @@ function blendSeam(ow,oh){
   }
   tmp.width = keep; tmp.height = oh;
   tctx.putImageData(out,0,0);
+  /* stretching keep back up to ow is anchored at x=0, which slides every feature
+     right; roll it back by half the discarded width so the photo stays centred */
+  var shift = ow*w/(2*keep);
   srcCtx.clearRect(0,0,ow,oh);
-  srcCtx.drawImage(tmp,0,0,keep,oh,0,0,ow,oh);
+  srcCtx.drawImage(tmp,0,0,keep,oh, -shift,0,ow,oh);
+  srcCtx.drawImage(tmp,0,0,keep,oh, ow-shift,0,ow,oh);
 }
 
 /* ---------------- intake ---------------- */
