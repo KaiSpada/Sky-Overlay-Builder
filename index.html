@@ -190,6 +190,7 @@
           </div>
           <div class="bearing"><span class="deg" id="degOut">000°</span><span class="card" id="cardOut">N</span></div>
           <button type="button" class="act line mini" id="fsBtn">Fullscreen</button>
+          <button type="button" class="act line mini" id="vidBtn" disabled>Export spin video</button>
           <p class="note">Drag to look around, scroll to zoom</p>
         </div>
 
@@ -424,11 +425,11 @@ function loadFile(f){
     $("dropTitle").textContent = f.name;
     $("dropSub").textContent = state.imgW+" × "+state.imgH+" — choose another to replace";
     if(!$("packfile").dataset.touched) $("packfile").value = prettyName(f.name);
-    $("dlZip").disabled = false; $("dlPng").disabled = false;
+    $("dlZip").disabled = false; $("dlPng").disabled = false; $("vidBtn").disabled = false;
     buildSource(); render();
   }).catch(function(){
     state.img = null; srcData = null;
-    $("dlZip").disabled = true; $("dlPng").disabled = true;
+    $("dlZip").disabled = true; $("dlPng").disabled = true; $("vidBtn").disabled = true;
     $("dropTitle").textContent = "Could not read that file";
     $("dropSub").textContent = whyItFailed(f);
     render();
@@ -511,21 +512,11 @@ document.addEventListener("keydown", function(e){ if(e.key === "Escape" && stage
 
 var camYaw = 0, camPitch = 0.12, camFov = 70, zoomT = null;
 var CARD = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
-function drawLook(hi){
-  if(!sheetData) return;
-  var fs = isFS(), W, H;
-  if(fs){
-    var cap = hi ? 1100 : 620;
-    var ar = (stage.clientWidth||16)/(stage.clientHeight||9);
-    if(ar >= 1){ W = cap; H = Math.max(1,Math.round(cap/ar)); }
-    else       { H = cap; W = Math.max(1,Math.round(cap*ar)); }
-  } else { W = H = 300; }
-  var T = curT, sd = sheetData.data;
-  look.width = W; look.height = H;
-  var out = lctx.createImageData(W,H), od = out.data;
-  var fov = camFov*Math.PI/180, tanY = Math.tan(fov/2), tanX = tanY*(W/H);
-  var cy = Math.cos(camYaw), sy = Math.sin(camYaw);
-  var cp = Math.cos(camPitch), sp = Math.sin(camPitch);
+/* one perspective frame of the cubemap, written straight into an ImageData buffer */
+function castInto(od, W, H, yaw, pitch, fovDeg, sd, T){
+  var fov = fovDeg*Math.PI/180, tanY = Math.tan(fov/2), tanX = tanY*(W/H);
+  var cy = Math.cos(yaw), sy = Math.sin(yaw);
+  var cp = Math.cos(pitch), sp = Math.sin(pitch);
   var fwd = [sy*cp, sp, -cy*cp], right = [cy, 0, sy];
   var up = [ right[1]*fwd[2]-right[2]*fwd[1], right[2]*fwd[0]-right[0]*fwd[2], right[0]*fwd[1]-right[1]*fwd[0] ];
   for(var py=0;py<H;py++){
@@ -554,12 +545,127 @@ function drawLook(hi){
       od[oi+3] = 255;
     }
   }
+}
+
+function drawLook(hi){
+  if(!sheetData) return;
+  var fs = isFS(), W, H;
+  if(fs){
+    var cap = hi ? 1100 : 620;
+    var ar = (stage.clientWidth||16)/(stage.clientHeight||9);
+    if(ar >= 1){ W = cap; H = Math.max(1,Math.round(cap/ar)); }
+    else       { H = cap; W = Math.max(1,Math.round(cap*ar)); }
+  } else { W = H = 300; }
+  look.width = W; look.height = H;
+  var out = lctx.createImageData(W,H);
+  castInto(out.data, W, H, camYaw, camPitch, camFov, sheetData.data, curT);
   lctx.putImageData(out,0,0);
   var deg = ((camYaw*180/Math.PI)%360+360)%360;
   var degTxt = ("00"+Math.round(deg)).slice(-3)+"°", cardTxt = CARD[Math.round(deg/22.5)%16];
   $("degOut").textContent = degTxt;  $("degOut2").textContent = degTxt;
   $("cardOut").textContent = cardTxt; $("cardOut2").textContent = cardTxt;
 }
+
+/* ---- spinning preview clip ----
+   frames are raycast ahead of time and kept as compressed blobs, then decoded
+   and played back at real speed into a captured canvas. pre-rendering keeps the
+   motion smooth however slow the raycast is; the blobs keep 180 frames of 1080p
+   from sitting in memory as raw pixels */
+var VID = {w:1920, h:1080, fps:30, sec:6,
+           fov:95,        // wider than the live preview so more sky fits in frame
+           pitch:0,       // degrees above the horizon the sweep is centred on
+           sway:20,       // how far it drifts up and down on the way round
+           sways:2,       // whole drifts per revolution, so the clip still loops
+           lookahead:8};  // frames decoded in advance of playback
+function pickMime(){
+  var want = ["video/mp4;codecs=avc1.4d002a","video/mp4;codecs=avc1","video/mp4",
+              "video/webm;codecs=vp9","video/webm;codecs=vp8","video/webm"];
+  for(var i=0;i<want.length;i++){
+    if(window.MediaRecorder && MediaRecorder.isTypeSupported(want[i])) return want[i];
+  }
+  return null;
+}
+function exportVideo(){
+  var btn = $("vidBtn");
+  if(!state.img || !sheetData) return;
+  var mime = pickMime();
+  if(!mime){ btn.disabled = true; btn.textContent = "Video not supported here"; return; }
+
+  btn.disabled = true;
+  render(state.tile);                                 // full sheet resolution for the clip
+  var sd = sheetData.data, T = curT;
+  var N = VID.fps*VID.sec, frames = [], i = 0;
+
+  var work = document.createElement("canvas");
+  work.width = VID.w; work.height = VID.h;
+  var wx = work.getContext("2d");
+  var buf = wx.createImageData(VID.w, VID.h);
+
+  function step(){
+    var t = i/N, TAU = Math.PI*2;
+    var pitch = (VID.pitch + VID.sway*Math.sin(t*TAU*VID.sways))*Math.PI/180;
+    castInto(buf.data, VID.w, VID.h, t*TAU, pitch, VID.fov, sd, T);
+    wx.putImageData(buf, 0, 0);
+    work.toBlob(function(b){
+      frames.push(b); i++;
+      btn.textContent = "Rendering " + Math.round(i/N*100) + "%";
+      if(i < N) setTimeout(step, 0); else record();
+    }, "image/jpeg", 0.95);
+  }
+
+  function record(){
+    render();                                          // restore the live preview
+    var c = document.createElement("canvas");
+    c.width = VID.w; c.height = VID.h;
+    var cx = c.getContext("2d");
+
+    var ready = new Array(frames.length);
+    function decode(k){
+      if(k >= frames.length || ready[k]) return;
+      createImageBitmap(frames[k]).then(function(bm){ ready[k] = bm; });
+    }
+    for(var d=0; d<VID.lookahead; d++) decode(d);
+
+    var rec = new MediaRecorder(c.captureStream(VID.fps), {mimeType:mime, videoBitsPerSecond:20000000});
+    var chunks = [];
+    rec.ondataavailable = function(e){ if(e.data && e.data.size) chunks.push(e.data); };
+    rec.onstop = function(){
+      var ext = mime.indexOf("mp4") >= 0 ? "mp4" : "webm";
+      var name = ($("packfile").value || "sky").replace(/[\/\\:*?"<>|]/g,"").trim() || "sky";
+      save(new Blob(chunks, {type:mime}), name + " preview." + ext);
+      ready.forEach(function(bm){ if(bm && bm.close) bm.close(); });
+      frames.length = 0;
+      btn.disabled = false; btn.textContent = "Export spin video";
+    };
+
+    var k = 0;
+    function begin(){
+      if(!ready[0]){ setTimeout(begin, 30); return; }   // wait for the first frame
+      cx.drawImage(ready[0], 0, 0);
+      rec.start();
+      var iv = setInterval(function(){
+        if(k >= frames.length){
+          clearInterval(iv);
+          setTimeout(function(){ rec.stop(); }, 250);
+          return;
+        }
+        var bm = ready[k];
+        if(bm){                                        // if a decode is late, the
+          cx.drawImage(bm, 0, 0);                      // previous frame stays up
+          if(bm.close) bm.close();
+          ready[k] = null;
+        }
+        decode(k + VID.lookahead);
+        k++;
+        btn.textContent = "Recording " + Math.round(k/frames.length*100) + "%";
+      }, 1000/VID.fps);
+    }
+    begin();
+  }
+
+  step();
+}
+
 (function dragLook(){
   var down=false, lx=0, ly=0;
   look.addEventListener("pointerdown",function(e){ down=true; lx=e.clientX; ly=e.clientY; look.setPointerCapture(e.pointerId); });
@@ -583,6 +689,7 @@ function drawLook(hi){
 })();
 document.getElementById("fsBtn").addEventListener("click", function(){ isFS() ? exitFS() : enterFS(); });
 document.getElementById("fsExit").addEventListener("click", exitFS);
+document.getElementById("vidBtn").addEventListener("click", exportVideo);
 
 /* ---------------- output files ---------------- */
 function propsText(){
